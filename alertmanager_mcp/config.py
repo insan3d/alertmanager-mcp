@@ -1,36 +1,43 @@
 """Load Alertmanager MCP configuration from environment variables."""
 
-import os
-from typing import Final
+from typing import Annotated
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+type PositiveFloat = Annotated[float, Field(gt=0)]
+type PositiveInt = Annotated[int, Field(gt=0)]
+type Port = Annotated[int, Field(ge=1, le=65535)]
 
 
-def _get_env_int(name: str, default: int) -> int:
-    """Return an integer environment variable or its default value."""
+class Settings(BaseSettings):
+    """Describe validated server configuration."""
 
-    value = os.getenv(name)
-    if value is None:
-        return default
+    model_config = SettingsConfigDict(frozen=True)
 
-    try:
-        return int(value)
+    alertmanager_url: str = "http://localhost:9093"
+    alertmanager_connect_timeout_seconds: PositiveFloat = 5.0
+    alertmanager_read_timeout_seconds: PositiveFloat = 10.0
+    alertmanager_write_timeout_seconds: PositiveFloat = 10.0
+    alertmanager_pool_timeout_seconds: PositiveFloat = 5.0
+    alertmanager_max_connections: PositiveInt = 100
+    alertmanager_max_keepalive_connections: PositiveInt = 20
+    alertmanager_keepalive_expiry_seconds: PositiveFloat = 5.0
+    mcp_name: str = "Alertmanager API Proxy"
+    mcp_host: str = "127.0.0.1"
+    mcp_port: Port = 8000
+    mcp_http_path: str = "/mcp"
+    metrics_host: str = "127.0.0.1"
+    metrics_port: Port = 8001
+    mcp_healthcheck_url: str | None = None
+    metrics_healthcheck_url: str | None = None
+    healthcheck_timeout_seconds: PositiveFloat = 5.0
 
-    except ValueError as exc:
-        msg = f"{name} must be an integer, got {value!r}"
-        raise ValueError(msg) from exc
+    @property
+    def alertmanager_api_url(self) -> str:
+        """Return the Alertmanager v2 API base URL."""
+
+        return f"{self.alertmanager_url.rstrip('/')}/api/v2"
 
 
-# Alertmanager connection settings.
-ALERTMANAGER_URL: Final = os.getenv("ALERTMANAGER_URL", "http://localhost:9093").rstrip("/")
-ALERTMANAGER_API_PREFIX: Final = os.getenv("ALERTMANAGER_API_PREFIX", "/api/v2").strip("/")
-ALERTMANAGER_TIMEOUT_SECONDS: Final = _get_env_int("ALERTMANAGER_TIMEOUT_SECONDS", 10)
-ALERTMANAGER_API_URL: Final = f"{ALERTMANAGER_URL}/{ALERTMANAGER_API_PREFIX}"
-
-# MCP Streamable HTTP listener settings.
-MCP_NAME: Final = os.getenv("MCP_NAME", "Alertmanager API Proxy")
-MCP_HOST: Final = os.getenv("MCP_HOST", "127.0.0.1")
-MCP_PORT: Final = _get_env_int("MCP_PORT", 8000)
-MCP_HTTP_PATH: Final = os.getenv("MCP_HTTP_PATH", "/mcp")
-
-# Prometheus metrics listener settings.
-METRICS_HOST: Final = os.getenv("METRICS_HOST", "127.0.0.1")
-METRICS_PORT: Final = _get_env_int("METRICS_PORT", 8001)
+SETTINGS = Settings()

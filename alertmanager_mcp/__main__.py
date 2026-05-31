@@ -2,64 +2,54 @@
 
 """Expose Alertmanager operations through an HTTP MCP server."""
 
-from contextlib import suppress
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
-from prometheus_client import start_http_server
+from starlette.applications import Starlette
+from starlette.routing import Mount
 
-from alertmanager_mcp.config import MCP_HOST, MCP_HTTP_PATH, MCP_NAME, MCP_PORT, METRICS_HOST, METRICS_PORT
-from alertmanager_mcp.models import JsonObject, Matcher
-from alertmanager_mcp.runtime import (
+from alertmanager_mcp.client import (
     MCP_SILENCES_CREATED,
-    MCP_TOOL_REQUESTS,
-    AppMcpContext,
     app_lifespan,
-    as_json_error,
-    as_json_matchers,
-    get_error,
-    get_http_client,
-    get_json_object,
-    get_json_objects,
-    is_success,
-    make_request,
+    get_alertmanager,
+    track_tool,
 )
+from alertmanager_mcp.config import SETTINGS
+from alertmanager_mcp.models import (  # noqa: TC001  # FastMCP resolves tool annotations at runtime.
+    JsonObject,
+    NonEmptyFilters,
+    NonEmptyMatchers,
+    Rfc3339Timestamp,
+    SilenceId,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 # Configure the MCP server's Streamable HTTP listener.
 mcp = FastMCP(
-    MCP_NAME,
-    host=MCP_HOST,
-    port=MCP_PORT,
-    streamable_http_path=MCP_HTTP_PATH,
-    lifespan=app_lifespan,
+    SETTINGS.mcp_name,
+    host=SETTINGS.mcp_host,
+    port=SETTINGS.mcp_port,
+    streamable_http_path=SETTINGS.mcp_http_path,
+    stateless_http=True,
+    json_response=True,
 )
 
 
 # Expose Alertmanager context and incident-response guidance to MCP clients.
 @mcp.resource("alertmanager://status")
-async def get_alertmanager_status(ctx: AppMcpContext) -> str:
+async def get_alertmanager_status() -> str:
     """
-    Return the current Alertmanager configuration.
-
-    Args:
-        ctx: Current MCP request context.
+    Return a safe summary of the current Alertmanager status.
 
     Returns:
-        The Alertmanager configuration or an API error message.
+        The Alertmanager version, cluster status, and uptime.
     """
 
-    response = await make_request(get_http_client(ctx), "GET", "status", "status")
-    if not is_success(response):
-        error = get_error(response)
-        return f"Failed to get status: {error['error']}"
-
-    data = get_json_object(response)
-    config = data.get("config")
-    if isinstance(config, dict):
-        original_config = config.get("original")
-        if isinstance(original_config, str):
-            return f"Alertmanager Config:\n{original_config}"
-
-    return "Alertmanager Config:\nNo config found"
+    return await get_alertmanager().get_status_summary()
 
 
 @mcp.prompt()
@@ -78,7 +68,7 @@ def emergency_silence_flow(alert_name: str) -> str:
 1. Ask for the engineer's name as it appears in Slack. It will be used as `created_by`.
 2. Ask how long the silence should remain active. Use 2h if the engineer does not specify a duration.
 3. Ask for a short incident-related comment explaining why the silence is needed and a link to the related Slack thread.
-4. Use `list_alerts` to find active alerts whose `alertname` label matches '{alert_name}'.
+4. Use `list_alerts` with the filter `alertname="{alert_name}"` to find matching alerts.
 5. If no matching alerts are found, report that clearly and ask whether the engineer wants to stop or provide a different alert name.
 6. If matching alerts are found, summarize them and propose the narrowest useful set of matchers. Do not silence unrelated alerts.
 7. Show the proposed matchers, start time, end time, Slack name, and comment. Ask for explicit confirmation before creating the silence.
@@ -88,43 +78,28 @@ def emergency_silence_flow(alert_name: str) -> str:
 
 # Register Alertmanager alert and silence operations for MCP clients.
 @mcp.tool()
-async def list_alerts(ctx: AppMcpContext) -> list[JsonObject]:
+async def list_alerts(filters: NonEmptyFilters) -> list[JsonObject]:
     """
     Return all current alerts from Alertmanager.
 
     Args:
-        ctx: Current MCP request context.
+        filters: Alertmanager label matchers, such as `alertname="HighLatency"`.
 
     Returns:
         The current alerts or an API error.
     """
 
-    tool_name = "list_alerts"
-    response = await make_request(
-        get_http_client(ctx),
-        "GET",
-        "alerts",
-        "alerts",
-        params={"active": "true", "silenced": "true", "inhibited": "true"},
-    )
-
-    if not is_success(response):
-        error = get_error(response)
-        MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="error").inc()
-        return [as_json_error(error)]
-
-    MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="success").inc()
-    return get_json_objects(response)
+    async with track_tool("list_alerts"):
+        return await get_alertmanager().get_alerts(filters)
 
 
 @mcp.tool()
 async def create_silence(
-    matchers: list[Matcher],
-    starts_at: str,
-    ends_at: str,
+    matchers: NonEmptyMatchers,
+    starts_at: Rfc3339Timestamp,
+    ends_at: Rfc3339Timestamp,
     created_by: str,
     comment: str,
-    ctx: AppMcpContext,
 ) -> JsonObject:
     """
     Create a silence in Alertmanager.
@@ -135,110 +110,57 @@ async def create_silence(
         ends_at: Silence end timestamp in RFC3339 format.
         created_by: Name of the engineer as it appears in Slack.
         comment: Reason for creating the silence.
-        ctx: Current MCP request context.
 
     Returns:
         The created silence or an API error.
     """
 
-    tool_name = "create_silence"
-    payload: JsonObject = {
-        "matchers": as_json_matchers(matchers),
-        "startsAt": starts_at,
-        "endsAt": ends_at,
-        "createdBy": created_by,
-        "comment": comment,
-    }
-
-    response = await make_request(
-        get_http_client(ctx),
-        "POST",
-        "silences",
-        "silences",
-        json=payload,
-    )
-
-    if not is_success(response):
-        error = get_error(response)
-        MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="error").inc()
-        return as_json_error(error)
-
-    MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="success").inc()
-    MCP_SILENCES_CREATED.inc()
-    return get_json_object(response)
+    async with track_tool("create_silence"):
+        silence = await get_alertmanager().create_silence(matchers, starts_at, ends_at, created_by, comment)
+        MCP_SILENCES_CREATED.inc()
+        return silence
 
 
 @mcp.tool()
-async def get_silence(silence_id: str, ctx: AppMcpContext) -> JsonObject:
+async def get_silence(silence_id: SilenceId) -> JsonObject:
     """
     Return information about a specific silence.
 
     Args:
         silence_id: UUID of the silence.
-        ctx: Current MCP request context.
 
     Returns:
         The requested silence or an API error.
     """
 
-    tool_name = "get_silence"
-    response = await make_request(
-        get_http_client(ctx),
-        "GET",
-        f"silence/{silence_id}",
-        "silence/{silence_id}",
-    )
-
-    if not is_success(response):
-        error = get_error(response)
-        MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="error").inc()
-        return as_json_error(error)
-
-    MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="success").inc()
-    return get_json_object(response)
+    async with track_tool("get_silence"):
+        return await get_alertmanager().get_silence(silence_id)
 
 
 @mcp.tool()
-async def list_silences(ctx: AppMcpContext, filter_query: str | None = None) -> list[JsonObject]:
+async def list_silences(filters: NonEmptyFilters) -> list[JsonObject]:
     """
     Return silences from Alertmanager.
 
     Args:
-        ctx: Current MCP request context.
-        filter_query: Optional Alertmanager filter, such as `status="active"`.
+        filters: Alertmanager label matchers, such as `alertname="HighLatency"`.
 
     Returns:
         The matching silences or an API error.
     """
 
-    tool_name = "list_silences"
-    params = {"filter": filter_query} if filter_query else {}
-    response = await make_request(
-        get_http_client(ctx),
-        "GET",
-        "silences",
-        "silences",
-        params=params,
-    )
-
-    if not is_success(response):
-        error = get_error(response)
-        MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="error").inc()
-        return [as_json_error(error)]
-
-    MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="success").inc()
-    return get_json_objects(response)
+    async with track_tool("list_silences"):
+        return await get_alertmanager().get_silences(filters)
 
 
 @mcp.tool()
 async def update_silence(
-    silence_id: str,
-    matchers: list[Matcher],
-    starts_at: str,
-    ends_at: str,
+    silence_id: SilenceId,
+    matchers: NonEmptyMatchers,
+    starts_at: Rfc3339Timestamp,
+    ends_at: Rfc3339Timestamp,
     created_by: str,
     comment: str,
-    ctx: AppMcpContext,
 ) -> JsonObject:
     """
     Update an existing silence.
@@ -250,71 +172,53 @@ async def update_silence(
         ends_at: Silence end timestamp in RFC3339 format.
         created_by: Name of the engineer as it appears in Slack.
         comment: Reason for updating the silence.
-        ctx: Current MCP request context.
 
     Returns:
         The updated silence or an API error.
     """
 
-    tool_name = "update_silence"
-    payload: JsonObject = {
-        "id": silence_id,
-        "matchers": as_json_matchers(matchers),
-        "startsAt": starts_at,
-        "endsAt": ends_at,
-        "createdBy": created_by,
-        "comment": comment,
-    }
-
-    response = await make_request(
-        get_http_client(ctx),
-        "POST",
-        "silences",
-        "silences",
-        json=payload,
-    )
-
-    if not is_success(response):
-        error = get_error(response)
-        MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="error").inc()
-        return as_json_error(error)
-
-    MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="success").inc()
-    return get_json_object(response)
+    async with track_tool("update_silence"):
+        return await get_alertmanager().update_silence(
+            silence_id,
+            matchers,
+            starts_at,
+            ends_at,
+            created_by,
+            comment,
+        )
 
 
 @mcp.tool()
-async def expire_silence(silence_id: str, ctx: AppMcpContext) -> JsonObject:
+async def expire_silence(silence_id: SilenceId) -> JsonObject:
     """
     Expire a silence before its scheduled end time.
 
     Args:
         silence_id: UUID of the silence to expire.
-        ctx: Current MCP request context.
 
     Returns:
         A success status or an API error.
     """
 
-    tool_name = "expire_silence"
-    response = await make_request(
-        get_http_client(ctx),
-        "DELETE",
-        f"silence/{silence_id}",
-        "silence/{silence_id}",
-    )
-
-    if not is_success(response):
-        error = get_error(response)
-        MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="error").inc()
-        return as_json_error(error)
-
-    MCP_TOOL_REQUESTS.labels(tool_name=tool_name, status="success").inc()
-    return {"status": "success"}
+    async with track_tool("expire_silence"):
+        await get_alertmanager().expire_silence(silence_id)
+        return {"status": "success"}
 
 
-# Run metrics on a separate listener while MCP serves Streamable HTTP requests.
+@asynccontextmanager
+async def server_lifespan(_app: Starlette) -> AsyncGenerator[None]:
+    """Keep process-scoped dependencies alive while the ASGI server runs."""
+
+    async with app_lifespan(), mcp.session_manager.run():
+        yield
+
+
+app = Starlette(
+    routes=[Mount("/", app=mcp.streamable_http_app())],
+    lifespan=server_lifespan,
+)
+
+
+# Run MCP over Streamable HTTP. The ASGI lifespan starts shared dependencies.
 if __name__ == "__main__":
-    with suppress(KeyboardInterrupt):
-        _ = start_http_server(METRICS_PORT, addr=METRICS_HOST)
-        mcp.run(transport="streamable-http")
+    uvicorn.run(app, host=SETTINGS.mcp_host, port=SETTINGS.mcp_port)

@@ -20,4 +20,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 EXPOSE 8000 8001
 
+HEALTHCHECK --interval=30s --timeout=8s --retries=3 \
+    CMD ["python", "-m", "alertmanager_mcp.healthcheck"]
+
 CMD ["python", "-m", "alertmanager_mcp"]
